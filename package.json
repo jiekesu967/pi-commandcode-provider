@@ -1,0 +1,49 @@
+{
+  "name": "pi-commandcode-provider",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Unofficial Command Code provider for pi, including the Go-plan CLI transport and browser login.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jiekesu967/pi-commandcode-provider.git"
+  },
+  "homepage": "https://github.com/jiekesu967/pi-commandcode-provider#readme",
+  "bugs": {
+    "url": "https://github.com/jiekesu967/pi-commandcode-provider/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "commandcode",
+    "command-code",
+    "provider",
+    "llm",
+    "adapter"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node tests/run-tests.mjs",
+    "test:smoke": "node tests/run-tests.mjs smoke",
+    "test:routing": "node tests/run-tests.mjs routing",
+    "test:login": "node tests/run-tests.mjs login",
+    "test:migration": "node tests/run-tests.mjs migration",
+    "test:align": "node tests/run-tests.mjs align",
+    "test:stream": "node tests/run-tests.mjs stream",
+    "test:live": "node tests/run-tests.mjs live",
+    "capabilities": "node scripts/extract-capabilities.mjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
