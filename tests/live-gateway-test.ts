@@ -14,6 +14,7 @@
  */
 import assert from "node:assert/strict";
 import type { Context, Model } from "@earendil-works/pi-ai";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import { streamCommandCode, type StreamDeps } from "../stream.ts";
 import { DEFAULT_API_BASE, buildCliBody, cliHeaders, endpointFor, openAiHeaders } from "../wire.ts";
 
@@ -105,10 +106,12 @@ await test("the engine classifies a real invalid key as a credential error", asy
 		contextWindow: 1_000_000,
 		maxTokens: 65_536,
 	};
-	const context: Context = {
+	// A provider only ever sees the normalized transcript, so build it the way
+	// pi does rather than with the `systemPrompt`/`tools` shorthand.
+	const context: Context = normalizeContext({
 		systemPrompt: "test",
 		messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
-	};
+	});
 	const deps: StreamDeps = {
 		workingDir: () => process.cwd(),
 		resolveAccount: async () => ({ key: INVALID_KEY, slotId: "default" }),

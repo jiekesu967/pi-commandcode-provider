@@ -20,6 +20,8 @@ import {
 	type Usage,
 } from "@earendil-works/pi-ai";
 import { randomUUID } from "node:crypto";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { systemTextFor, toCliMessages, toOpenAiMessages, toolsFor } from "./convert.ts";
 import {
 	buildCliBody,
@@ -94,6 +96,25 @@ function createAssembler(): Assembler {
 		usage: undefined,
 		stopReason: undefined,
 	};
+}
+
+/**
+ * Optional wire capture for debugging. `COMMANDCODE_DEBUG_DUMP=<dir>` appends
+ * every request body (`request-<pid>.json`) and every raw stream line
+ * (`stream-<pid>.ndjson`) to that directory. Without it the only evidence of
+ * a bad response is pi's decoded message, which cannot distinguish "the
+ * gateway sent no tool call" from "the adapter dropped one".
+ */
+const DEBUG_DUMP_DIR = process.env.COMMANDCODE_DEBUG_DUMP?.trim();
+
+function capture(name: string, text: string): void {
+	if (!DEBUG_DUMP_DIR) return;
+	try {
+		mkdirSync(DEBUG_DUMP_DIR, { recursive: true });
+		appendFileSync(join(DEBUG_DUMP_DIR, name), text.endsWith("\n") ? text : `${text}\n`);
+	} catch {
+		// Capture is diagnostic only: it must never break a request.
+	}
 }
 
 /** Empty usage record so partial messages always have a complete shape. */
@@ -591,7 +612,25 @@ export function streamCommandCode(
 
 			for (;;) {
 				tried.add(apiKey);
-				const attempt = await connect(deps, apiKey, transport, buildBody(transport), apiBase, options?.signal);
+				const requestBody = buildBody(transport);
+				capture(
+					`request-${process.pid}.json`,
+					JSON.stringify(
+						{
+							transport,
+							endpoint: endpointFor(transport, apiBase),
+							// The resolved request options are captured too: a
+							// missing reasoning level is otherwise invisible on
+							// the wire, since an absent `reasoning_effort` field
+							// looks the same as a provider that never asked.
+							options: { reasoning: options?.reasoning, maxTokens: options?.maxTokens },
+							body: requestBody,
+						},
+						null,
+						2,
+					),
+				);
+				const attempt = await connect(deps, apiKey, transport, requestBody, apiBase, options?.signal);
 				if ("response" in attempt) {
 					connected = attempt;
 					break;
@@ -632,6 +671,7 @@ export function streamCommandCode(
 
 			const asm = createAssembler();
 			for await (const line of readLines(connected.response, options?.signal, deps.streamIdleTimeoutMs())) {
+				capture(`stream-${process.pid}.ndjson`, line);
 				const event = parseStreamLine(line);
 				if (event === undefined) continue;
 				if (transport === "cli") handleCliEvent(asm, event, output, stream);

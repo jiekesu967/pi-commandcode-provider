@@ -21,15 +21,14 @@ const PROJECT_ROOT = dirname(HERE);
 const LINK_ROOT = join(PROJECT_ROOT, "node_modules", "@earendil-works");
 
 /** pi's bundled copies of the core packages, which extensions borrow. */
-const PI_PACKAGES = join(
+const PI_PACKAGE_ROOT = join(
 	process.env.APPDATA ?? join(process.env.USERPROFILE ?? "", "AppData", "Roaming"),
 	"npm",
 	"node_modules",
 	"@earendil-works",
 	"pi-coding-agent",
-	"node_modules",
-	"@earendil-works",
 );
+const PI_PACKAGES = join(PI_PACKAGE_ROOT, "node_modules", "@earendil-works");
 
 const SUITES = [
 	{ prefix: "smoke", file: "smoke-test.ts", needsLink: false },
@@ -38,11 +37,19 @@ const SUITES = [
 	{ prefix: "migration", file: "migration-test.ts", needsLink: false },
 	{ prefix: "align", file: "align-test.ts", needsLink: true },
 	{ prefix: "stream", file: "stream-test.ts", needsLink: true },
+	{ prefix: "search", file: "search-test.ts", needsLink: true },
 	{ prefix: "live", file: "live-gateway-test.ts", needsLink: true },
+	// Opt-in: talks to the real gateway with your own key and spends quota, so
+	// it runs only when named explicitly (`node run-tests.mjs loop`).
+	{ prefix: "loop", file: "loop-live.ts", needsLink: true, manual: true },
+	// Same, for the web tools: `node run-tests.mjs live-search`.
+	{ prefix: "live-search", file: "live-search-test.ts", needsLink: true, manual: true },
 ];
 
 const filter = process.argv[2];
-const selected = SUITES.filter((suite) => filter === undefined || suite.prefix.startsWith(filter));
+const selected = SUITES.filter((suite) =>
+	filter === undefined ? suite.manual !== true : suite.prefix.startsWith(filter),
+);
 
 if (selected.length === 0) {
 	console.error(`no suite matches "${filter}" (available: ${SUITES.map((s) => s.prefix).join(", ")})`);
@@ -66,6 +73,14 @@ if (needsLink) {
 		if (!existsSync(target)) continue;
 		// A junction needs no elevation on Windows and is what npm/pnpm use.
 		symlinkSync(target, link, "junction");
+	}
+	// `typebox` is host-provided like the pi packages, but it is unscoped, so
+	// it needs its own link at the node_modules root — `search.ts` imports
+	// `Type` from it to declare the tool parameter schemas.
+	const typeboxLink = join(PROJECT_ROOT, "node_modules", "typebox");
+	const typeboxTarget = join(PI_PACKAGE_ROOT, "node_modules", "typebox");
+	if (!existsSync(typeboxLink) && existsSync(typeboxTarget)) {
+		symlinkSync(typeboxTarget, typeboxLink, "junction");
 	}
 }
 

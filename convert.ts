@@ -19,6 +19,7 @@
  *     message that names the tool they came from.
  */
 import type { Context, Message, Tool } from "@earendil-works/pi-ai";
+import { getCurrentSystemPrompt, getCurrentTools } from "./transcript-compat.ts";
 import { isRecord, stringValue, type CliMessage, type OpenAiMessage } from "./wire.ts";
 
 /** The gateway rejects tool call ids longer than this. */
@@ -116,32 +117,45 @@ function toolResultImageNote(images: { mimeType: string }[]): string {
 	return `${TOOL_RESULT_IMAGE_TEXT} ${count} (${images[0]?.mimeType ?? "image"})`;
 }
 
-/** The system prompt text: pi's `systemPrompt` plus any system messages. */
+/**
+ * The system prompt text for one request.
+ *
+ * pi 0.86 carries the prompt in a leading `system` MESSAGE (`content` plus
+ * named `sections`), not in `Context.systemPrompt`: that field is only
+ * shorthand for callers, folded into the message list by `normalizeContext()`
+ * before a provider ever sees it. Reading `context.systemPrompt` therefore
+ * yielded `""`, so the gateway received no prompt at all and substituted its
+ * own Claude-Code-flavoured one — which is what made the model answer with
+ * text-mode tool calls instead of function calls. Replaying the transcript's
+ * system messages is the supported way to recover the prompt.
+ */
 export function systemTextFor(context: Context, extra?: string): string {
-	const inline = context.messages
-		.filter((message) => message.role === "user")
-		.map((message) =>
-			typeof message.content === "string"
-				? ""
-				: message.content
-						.filter((block) => block.type === "text")
-						.map((block) => block.text)
-						.join("\n"),
-		)
-		.filter(Boolean);
-	// pi carries the prompt in `systemPrompt`; the inline scan above only
-	// exists so a caller that inlined a system message is not silently
-	// dropped. In practice `systemPrompt` is the whole story.
-	void inline;
-	return [extra ?? "", context.systemPrompt ?? ""].filter(Boolean).join("\n\n");
+	// pi 1.0 把 prompt 直接放在 `context.systemPrompt`（messages 里不再有 system message）；
+	// 更早的版本会把它 normalize 进 transcript 的 system message，此时 `context.systemPrompt`
+	// 为空，需要重放 system message 才能复原。两种形态都支持。
+	const base =
+		context.systemPrompt && context.systemPrompt.length > 0
+			? context.systemPrompt
+			: getCurrentSystemPrompt(context.messages);
+	return [extra ?? "", base].filter(Boolean).join("\n\n");
 }
 
-/** Map pi tools onto the flat `{name, description, parameters}` shape. */
+/**
+ * The tools available for one request.
+ *
+ * Same 0.86 shift as {@link systemTextFor}: tool declarations live on the
+ * transcript's system messages (`toolsAdded` / `toolsRemoved`), while
+ * `Context.tools` is empty for a normalized request. `getCurrentTools`
+ * replays those deltas. Parameters are JSON round-tripped because typebox
+ * schemas carry symbol keys that do not survive `JSON.stringify`.
+ */
 export function toolsFor(context: Context): { name: string; description: string; parameters: unknown }[] {
-	return (context.tools ?? []).map((tool: Tool) => ({
+	// 同 `systemTextFor`：pi 1.0 用 `context.tools`，旧版从 transcript 的 system message 折叠。
+	const source = context.tools && context.tools.length > 0 ? context.tools : getCurrentTools(context.messages);
+	return source.map((tool: Tool) => ({
 		name: tool.name,
 		description: tool.description,
-		parameters: tool.parameters,
+		parameters: JSON.parse(JSON.stringify(tool.parameters)) as unknown,
 	}));
 }
 
@@ -152,6 +166,11 @@ export function toCliMessages(messages: Message[]): CliMessage[] {
 	const out: CliMessage[] = [];
 
 	for (const message of messages) {
+		// The prompt and the tool declarations travel out of band (see
+		// `systemTextFor` / `toolsFor`), so system messages are not replayed as
+		// conversation turns. Dropping them here is deliberate, not incidental.
+		if (message.role === "system") continue;
+
 		if (message.role === "user") {
 			const parts: unknown[] = [];
 			if (typeof message.content === "string") {
@@ -237,6 +256,10 @@ export function toOpenAiMessages(messages: Message[]): OpenAiMessage[] {
 	const out: OpenAiMessage[] = [];
 
 	for (const message of messages) {
+		// System messages are carried as the leading `system` field rather than
+		// replayed here; see `systemTextFor`.
+		if (message.role === "system") continue;
+
 		if (message.role === "user") {
 			const parts: unknown[] = [];
 			if (typeof message.content === "string") {

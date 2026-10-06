@@ -15,6 +15,7 @@
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import { streamCommandCode, type StreamDeps } from "../stream.ts";
 
 interface Captured {
@@ -83,8 +84,14 @@ const model: Model<string> = {
 	maxTokens: 65_536,
 };
 
+/**
+ * The context a provider actually receives. pi folds `systemPrompt` and
+ * `tools` into a leading system message with `normalizeContext()` before
+ * calling the provider, so a test that skipped that step would exercise a
+ * shape no real request ever has.
+ */
 function makeContext(): Context {
-	return {
+	return normalizeContext({
 		systemPrompt: "You are a coding agent.",
 		messages: [{ role: "user", content: "list the files", timestamp: Date.now() }],
 		tools: [
@@ -94,7 +101,7 @@ function makeContext(): Context {
 				parameters: { type: "object", properties: { command: { type: "string" } } },
 			},
 		],
-	};
+	});
 }
 
 function makeDeps(overrides: Partial<StreamDeps> = {}): StreamDeps {
@@ -171,6 +178,29 @@ await test("sends the system prompt and tools in the OpenAI body", async () => {
 	assert.equal(messages[0].content, "You are a coding agent.");
 	const tools = body.tools as Record<string, unknown>[];
 	assert.equal((tools[0].function as Record<string, unknown>).name, "bash");
+});
+
+await test("carries the prompt and tools on the CLI transport too", async () => {
+	// The regression this guards: pi 0.86 hands the prompt and the tool
+	// declarations to a provider inside the transcript's system message, and
+	// an adapter that reads `Context.systemPrompt` / `Context.tools` instead
+	// sends `system: ""` with `tools: []`. The gateway then substitutes its
+	// own harness prompt, the model answers with text-mode tool calls, and
+	// the turn ends without ever running a tool.
+	handler = (req, res) => {
+		if (req.url?.startsWith("/provider/v1")) {
+			res.writeHead(403).end(JSON.stringify({ error: { code: "upgrade_required" } }));
+			return;
+		}
+		ndjson(res, [{ type: "text-delta", text: "ok" }, { type: "finish", finishReason: "stop" }]);
+	};
+	await collect();
+	const params = captured[1].body.params as Record<string, unknown>;
+	assert.equal(params.system, "You are a coding agent.", "the system prompt must reach the CLI transport");
+	const tools = params.tools as Record<string, unknown>[];
+	assert.equal(tools.length, 1, "the tool declarations must reach the CLI transport");
+	assert.equal(tools[0].name, "bash");
+	assert.ok(tools[0].input_schema, "tools keep a JSON schema");
 });
 
 await test("parses streamed tool calls", async () => {

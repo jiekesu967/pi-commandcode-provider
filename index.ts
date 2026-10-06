@@ -76,6 +76,14 @@ const WIDGET_KEY = "commandcode-usage";
 /** How often the panel re-polls usage while visible. */
 const REFRESH_MS = 60_000;
 
+/**
+ * How long startup waits for the plan-tier probe before registering anyway.
+ * The billing endpoint is a network call; waiting for it unconditionally used
+ * to add seconds to every TUI start. When the probe lands after this budget,
+ * `refreshTier()` re-registers and the plan filter converges afterwards.
+ */
+const TIER_BOOT_BUDGET_MS = 400;
+
 /** Plugin configuration, as stored in settings.json. */
 interface CommandCodeConfig {
 	apiBase?: string;
@@ -417,18 +425,23 @@ export default async function (pi: ExtensionAPI) {
 		}
 	};
 
-	// Load the catalog before registering, so `pi --list-models` and startup
-	// model selection see the whole catalog. A failure here must not stop pi.
-	try {
-		await catalog.load();
-	} catch (error) {
-		pi.on("session_start", (_event, ctx) => {
-			ctx.ui.notify(
-				`Command Code 模型目录加载失败：${error instanceof Error ? error.message : String(error)}`,
-				"warning",
-			);
+	// Startup must never wait on the network: a slow catalog endpoint used to
+	// delay the TUI by several seconds. Prime the catalog from the on-disk cache
+	// (milliseconds) so `pi --list-models` and startup model selection still see
+	// a full catalog, then refresh live in the background. A failure keeps the
+	// cached catalog and surfaces a warning once a session starts.
+	await catalog.preloadFromCache();
+	void catalog
+		.load({ force: true })
+		.then(() => register())
+		.catch((error: unknown) => {
+			pi.on("session_start", (_event, ctx) => {
+				ctx.ui.notify(
+					`Command Code 模型目录加载失败：${error instanceof Error ? error.message : String(error)}`,
+					"warning",
+				);
+			});
 		});
-	}
 	// The gateway refuses a stale CLI version on the transport the Go plan
 	// depends on, so resolve the current release rather than trusting the
 	// bundled constant. A failure just keeps the bundled value.
@@ -451,13 +464,18 @@ export default async function (pi: ExtensionAPI) {
 		});
 	}
 
-	// Resolve the account's plan tier BEFORE registering models, so the plan
-	// filter applies from the very first registration. Doing this only on
-	// `session_start` left non-session paths (notably `pi --list-models`)
-	// registering with an unknown tier, which fails open and lists models the
-	// subscription cannot actually use. A failure leaves it undefined, which
-	// also fails open — deliberately, since the server is the final gate.
-	await refreshTier();
+	// Resolve the account's plan tier so the plan filter applies from the very
+	// first registration, but cap the wait: a slow billing endpoint must not
+	// hold the TUI hostage. A timeout leaves the tier unknown, which fails open
+	// — deliberately, since the server is the final gate — and the probe keeps
+	// running in the background, re-registering if the tier turns out different.
+	await Promise.race([
+		refreshTier(),
+		new Promise<void>((resolve) => {
+			const timer = setTimeout(resolve, TIER_BOOT_BUDGET_MS);
+			timer.unref?.();
+		}),
+	]);
 	register();
 
 	// ---------------------------------------------------------------------

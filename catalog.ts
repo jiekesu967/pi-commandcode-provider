@@ -206,6 +206,18 @@ export class CatalogClient {
 		return this.models;
 	}
 
+	/**
+	 * Prime the in-memory catalog from the on-disk cache without touching the
+	 * network. Startup uses this so a slow or unreachable catalog endpoint
+	 * cannot delay the TUI; {@link load} refreshes it in the background.
+	 */
+	async preloadFromCache(): Promise<CatalogModel[]> {
+		if (this.models.length > 0) return this.models;
+		const cached = await readCatalogCache(this.cachePath());
+		if (cached !== undefined) this.models = cached;
+		return this.models;
+	}
+
 	/** Load the catalog: network first, then the cache. */
 	async load(options?: { force?: boolean; signal?: AbortSignal }): Promise<CatalogModel[]> {
 		const cachePath = this.cachePath();
