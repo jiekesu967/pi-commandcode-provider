@@ -117,6 +117,34 @@ function toolResultImageNote(images: { mimeType: string }[]): string {
 	return `${TOOL_RESULT_IMAGE_TEXT} ${count} (${images[0]?.mimeType ?? "image"})`;
 }
 
+/** One image lifted out of a tool result, pending emission. */
+interface CarriedImage {
+	data: string;
+	mimeType: string;
+}
+
+/**
+ * Pack lifted images into a single user message.
+ *
+ * Placement matters more than shape: this message must be emitted **after the
+ * whole run of tool results** from one assistant turn, never directly after
+ * the result it came from. A user message wedged between two results of the
+ * same turn breaks the call/result adjacency that strict backends require —
+ * `/alpha/generate` answers with `Tool result is missing for tool call …`,
+ * and the Provider API answers with HTTP 400 `invalid_request_error`.
+ */
+function carriedImageMessage(images: CarriedImage[], transport: "cli" | "openai"): { role: "user"; content: unknown[] } {
+	const parts: unknown[] = [{ type: "text", text: toolResultImageNote(images) }];
+	for (const image of images) {
+		parts.push(
+			transport === "cli"
+				? { type: "image", source: { type: "base64", media_type: image.mimeType, data: image.data } }
+				: { type: "image_url", image_url: { url: `data:${image.mimeType};base64,${image.data}` } },
+		);
+	}
+	return { role: "user", content: parts };
+}
+
 /**
  * The system prompt text for one request.
  *
@@ -164,12 +192,42 @@ export function toCliMessages(messages: Message[]): CliMessage[] {
 	const { ids: paired, names: toolNames } = pairedToolCalls(messages);
 	const wireIds = wireToolCallIds(paired);
 	const out: CliMessage[] = [];
+	// Lifted images, held back until the current run of tool results ends.
+	const carried: CarriedImage[] = [];
+	const flushCarried = () => {
+		if (carried.length === 0) return;
+		out.push(carriedImageMessage(carried.splice(0, carried.length), "cli"));
+	};
 
 	for (const message of messages) {
 		// The prompt and the tool declarations travel out of band (see
 		// `systemTextFor` / `toolsFor`), so system messages are not replayed as
 		// conversation turns. Dropping them here is deliberate, not incidental.
 		if (message.role === "system") continue;
+
+		if (message.role === "toolResult") {
+			if (!paired.has(message.toolCallId)) continue;
+			const media = toolResultMedia(message.content);
+			out.push({
+				role: "tool",
+				content: [
+					{
+						type: "tool-result",
+						toolCallId: wireIds.get(message.toolCallId) ?? message.toolCallId,
+						toolName: toolNames.get(message.toolCallId) || message.toolName || "unknown",
+						output: message.isError
+							? { type: "error-text", value: toolResultTextForWire(media) }
+							: { type: "text", value: toolResultTextForWire(media) },
+					},
+				],
+			});
+			if (media.images.length > 0) carried.push(...media.images);
+			continue;
+		}
+
+		// Any other message closes the current run of tool results, so their
+		// images can no longer split a call/result pair.
+		flushCarried();
 
 		if (message.role === "user") {
 			const parts: unknown[] = [];
@@ -211,34 +269,9 @@ export function toCliMessages(messages: Message[]): CliMessage[] {
 			continue;
 		}
 
-		// toolResult
-		if (!paired.has(message.toolCallId)) continue;
-		const media = toolResultMedia(message.content);
-		out.push({
-			role: "tool",
-			content: [
-				{
-					type: "tool-result",
-					toolCallId: wireIds.get(message.toolCallId) ?? message.toolCallId,
-					toolName: toolNames.get(message.toolCallId) || message.toolName || "unknown",
-					output: message.isError
-						? { type: "error-text", value: toolResultTextForWire(media) }
-						: { type: "text", value: toolResultTextForWire(media) },
-				},
-			],
-		});
-		if (media.images.length > 0) {
-			const carried: unknown[] = [{ type: "text", text: toolResultImageNote(media.images) }];
-			for (const image of media.images) {
-				carried.push({
-					type: "image",
-					source: { type: "base64", media_type: image.mimeType, data: image.data },
-				});
-			}
-			out.push({ role: "user", content: carried });
-		}
 	}
 
+	flushCarried();
 	return out;
 }
 
@@ -254,11 +287,33 @@ export function toOpenAiMessages(messages: Message[]): OpenAiMessage[] {
 	const { ids: paired } = pairedToolCalls(messages);
 	const wireIds = wireToolCallIds(paired);
 	const out: OpenAiMessage[] = [];
+	// Lifted images, held back until the current run of tool results ends.
+	const carried: CarriedImage[] = [];
+	const flushCarried = () => {
+		if (carried.length === 0) return;
+		out.push(carriedImageMessage(carried.splice(0, carried.length), "openai"));
+	};
 
 	for (const message of messages) {
 		// System messages are carried as the leading `system` field rather than
 		// replayed here; see `systemTextFor`.
 		if (message.role === "system") continue;
+
+		if (message.role === "toolResult") {
+			if (!paired.has(message.toolCallId)) continue;
+			const media = toolResultMedia(message.content);
+			out.push({
+				role: "tool",
+				tool_call_id: wireIds.get(message.toolCallId) ?? message.toolCallId,
+				content: toolResultTextForWire(media),
+			});
+			if (media.images.length > 0) carried.push(...media.images);
+			continue;
+		}
+
+		// Any other message closes the current run of tool results, so their
+		// images can no longer split a call/result pair.
+		flushCarried();
 
 		if (message.role === "user") {
 			const parts: unknown[] = [];
@@ -316,26 +371,9 @@ export function toOpenAiMessages(messages: Message[]): OpenAiMessage[] {
 			continue;
 		}
 
-		// toolResult
-		if (!paired.has(message.toolCallId)) continue;
-		const media = toolResultMedia(message.content);
-		out.push({
-			role: "tool",
-			tool_call_id: wireIds.get(message.toolCallId) ?? message.toolCallId,
-			content: toolResultTextForWire(media),
-		});
-		if (media.images.length > 0) {
-			const carried: unknown[] = [{ type: "text", text: toolResultImageNote(media.images) }];
-			for (const image of media.images) {
-				carried.push({
-					type: "image_url",
-					image_url: { url: `data:${image.mimeType};base64,${image.data}` },
-				});
-			}
-			out.push({ role: "user", content: carried });
-		}
 	}
 
+	flushCarried();
 	return out;
 }
 

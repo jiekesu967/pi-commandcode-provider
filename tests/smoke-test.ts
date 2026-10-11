@@ -262,6 +262,49 @@ await test("hoists images out of a tool result into a following user message", (
 	assert.equal(parts[1].type, "image");
 });
 
+await test("keeps lifted images after the entire run of tool results", () => {
+	const twoCalls = {
+		...assistantWithTool,
+		content: [
+			{ type: "toolCall" as const, id: "call_1", name: "read", arguments: { path: "a.png" } },
+			{ type: "toolCall" as const, id: "call_2", name: "read", arguments: { path: "b.png" } },
+		],
+	};
+	const first = {
+		role: "toolResult" as const,
+		toolCallId: "call_1",
+		toolName: "read",
+		content: [
+			{ type: "text" as const, text: "first:" },
+			{ type: "image" as const, data: "QUJD", mimeType: "image/png" },
+		],
+		isError: false,
+		timestamp: 0,
+	};
+	const second = {
+		...first,
+		toolCallId: "call_2",
+		content: [
+			{ type: "text" as const, text: "second:" },
+			{ type: "image" as const, data: "REVG", mimeType: "image/png" },
+		],
+	};
+	for (const [label, out] of [
+		["cli", toCliMessages([twoCalls, first, second])],
+		["openai", toOpenAiMessages([twoCalls, first, second])],
+	] as const) {
+		const roles = out.map((entry) => (entry as Record<string, unknown>).role);
+		// A user message between the two tool results would break the call/result pair.
+		assert.deepEqual(roles, ["assistant", "tool", "tool", "user"], `${label} ordering`);
+		const parts = (out[3] as Record<string, unknown>).content as Record<string, unknown>[];
+		assert.equal(
+			parts.filter((part) => String(part.type).startsWith("image")).length,
+			2,
+			`${label} carries both images`,
+		);
+	}
+});
+
 await test("detects image content for the vision gate", () => {
 	assert.equal(hasImageContent([userText]), false);
 	assert.equal(

@@ -31,7 +31,7 @@ const PI_PACKAGE_ROOT = join(
 const PI_PACKAGES = join(PI_PACKAGE_ROOT, "node_modules", "@earendil-works");
 
 const SUITES = [
-	{ prefix: "smoke", file: "smoke-test.ts", needsLink: false },
+	{ prefix: "smoke", file: "smoke-test.ts", needsLink: true },
 	{ prefix: "routing", file: "routing-test.ts", needsLink: false },
 	{ prefix: "login", file: "login-test.ts", needsLink: false },
 	{ prefix: "migration", file: "migration-test.ts", needsLink: false },
