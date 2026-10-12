@@ -63,6 +63,7 @@ import {
 	parseRetryAfterMs,
 	stringValue,
 } from "./wire.ts";
+import { createCommandCodeFetch, transportSettingsFrom, type TransportSettingsSource } from "./net.ts";
 
 /** The private CLI routes the official client's web tools post to. */
 export const SEARCH_ROUTE = "/alpha/web-search";
@@ -109,7 +110,7 @@ export interface SearchSettings {
 }
 
 /** The whole `commandcode` block, as far as the web tools need it. */
-interface CommandCodeSettings {
+interface CommandCodeSettings extends TransportSettingsSource {
 	apiBase?: string;
 	apiKeyEnv?: string;
 	accounts?: AccountConfig[];
@@ -751,6 +752,14 @@ export default function (pi: ExtensionAPI) {
 		apiBase,
 		cliVersion: () => cliVersion,
 		workingDir,
+		// Same origin as the model, so it reuses the same edge pin and the same
+		// warm socket. The web tools enforce their own timeout
+		// (`commandcode.search.timeoutMs`), so the transport's header budget
+		// stays out of the way.
+		fetchImpl: createCommandCodeFetch(() => ({
+			...transportSettingsFrom(readSettings()),
+			headersTimeoutMs: undefined,
+		})),
 		resolveAccount: async (options) => {
 			const account = await pool.resolveKey(options);
 			return account === undefined ? undefined : { key: account.key, slotId: account.slot.id };

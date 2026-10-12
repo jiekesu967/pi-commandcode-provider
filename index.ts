@@ -27,7 +27,12 @@
  *     "filterModelsByPlan": true,
  *     "visibleModels": [],
  *     "requestTimeoutMs": 60000,
- *     "streamIdleTimeoutMs": 300000
+ *     "streamIdleTimeoutMs": 300000,
+ *     "connectTimeoutMs": 15000,
+ *     "connectRetries": 2,
+ *     "keepAliveMs": 300000,
+ *     "edgePinning": true,
+ *     "edgeIps": ["104.18.32.1"]
  *   }
  * }
  * ```
@@ -59,6 +64,7 @@ import {
 	modelVisibleInPlan,
 } from "./catalog.ts";
 import { streamCommandCode } from "./stream.ts";
+import { transportSettingsFrom, edgeStatus, transportDiagnostics, createCommandCodeFetch } from "./net.ts";
 import { BillingAccessCache, UsageClient, type UsageReport } from "./usage.ts";
 import {
 	COMMANDCODE_API,
@@ -98,6 +104,22 @@ interface CommandCodeConfig {
 	requestTimeoutMs?: number;
 	streamIdleTimeoutMs?: number;
 	workingDir?: string;
+	/** Pin requests to the best-scoring Cloudflare edge. Default true. */
+	edgePinning?: boolean;
+	/** Candidate edge addresses; replaces the built-in list when given. */
+	edgeIps?: string[];
+	/** Extra hostnames edge pinning applies to. */
+	edgeHosts?: string[];
+	/** Re-probe the candidates in the background. Default true. */
+	edgeProbe?: boolean;
+	/** How long a ranking is trusted before it is refreshed. */
+	edgeRefreshMs?: number;
+	/** TCP+TLS establishment budget, per attempt. */
+	connectTimeoutMs?: number;
+	/** Retries after a connection-phase failure. */
+	connectRetries?: number;
+	/** How long an idle keep-alive socket is held open. */
+	keepAliveMs?: number;
 }
 
 const DEFAULTS = {
@@ -259,7 +281,23 @@ export default async function (pi: ExtensionAPI) {
 	// ---------------------------------------------------------------------
 	// Wiring
 	// ---------------------------------------------------------------------
-	const catalog = new CatalogClient(apiBase, () => readConfig().modelsCachePath ?? DEFAULT_CACHE_PATH);
+
+	/**
+	 * Every Command Code call this plugin makes — catalog, usage, streaming —
+	 * goes through the same transport (see `net.ts`), so the whole plugin
+	 * benefits from the pinned edge and the warm socket. The control endpoints
+	 * keep their own short timeouts, hence no header budget here.
+	 */
+	const controlFetch = createCommandCodeFetch(() => ({
+		...transportSettingsFrom(readConfig()),
+		headersTimeoutMs: undefined,
+	}));
+
+	const catalog = new CatalogClient(
+		apiBase,
+		() => readConfig().modelsCachePath ?? DEFAULT_CACHE_PATH,
+		controlFetch,
+	);
 
 	/**
 	 * The `x-command-code-version` value to send. The gateway refuses stale
@@ -268,7 +306,7 @@ export default async function (pi: ExtensionAPI) {
 	 * hardcoded constant. Until it resolves, the bundled constant is used.
 	 */
 	let cliVersion = COMMAND_CODE_CLI_VERSION;
-	const usageClient = new UsageClient(apiBase, () => cliVersion);
+	const usageClient = new UsageClient(apiBase, () => cliVersion, controlFetch);
 	const billing = new BillingAccessCache(usageClient);
 	const pool = new AccountPool(
 		() => slotsFromConfig(readConfig().accounts, readConfig().apiKeyEnv ?? DEFAULTS.apiKeyEnv, "默认账户"),
@@ -331,7 +369,39 @@ export default async function (pi: ExtensionAPI) {
 		modelMaxTokens: (model: string) => catalog.maxTokensFor(model),
 		streamIdleTimeoutMs: () => readConfig().streamIdleTimeoutMs ?? DEFAULTS.streamIdleTimeoutMs,
 		requestTimeoutMs: () => readConfig().requestTimeoutMs ?? DEFAULTS.requestTimeoutMs,
+		transport: () => transportSettingsFrom(readConfig()),
 		cliVersion: () => cliVersion,
+	};
+
+	/**
+	 * What the transport is doing right now: the edge ranking, the pooled
+	 * sockets, and the retry/keep-alive policy. Printed by
+	 * `/commandcode-status`, so "is the pin actually on?" needs no log
+	 * spelunking.
+	 */
+	const transportLines = (): string[] => {
+		const configured = readConfig();
+		const lines: string[] = [];
+		if (configured.edgePinning ?? true) {
+			const status = edgeStatus();
+			const ranking = status.ranking.slice(0, 3).join(" > ") || "(等待探测)";
+			const quarantined = status.quarantined.length > 0 ? ` · 隔离 ${status.quarantined.join(",")}` : "";
+			lines.push(`  边缘节点: ${ranking}${quarantined}${status.probing ? " (探测中)" : ""}`);
+		} else {
+			lines.push("  边缘节点: 已关闭（edgePinning=false，走系统 DNS）");
+		}
+		const pools = transportDiagnostics();
+		lines.push(
+			pools.length === 0
+				? "  连接池: 尚未建立（本次会话还没有请求）"
+				: `  连接池: ${pools.map((pool) => `${pool.pool} 复用=${pool.free} 在用=${pool.active}`).join(" · ")}`,
+		);
+		lines.push(
+			`  连接: keep-alive ${Math.round((configured.keepAliveMs ?? 300_000) / 1000)}s · ` +
+				`连接超时 ${Math.round((configured.connectTimeoutMs ?? 15_000) / 1000)}s · ` +
+				`连接期重试 ${configured.connectRetries ?? 2} 次`,
+		);
+		return lines;
 	};
 
 	// ---------------------------------------------------------------------
@@ -646,6 +716,7 @@ export default async function (pi: ExtensionAPI) {
 					`  API 地址: ${apiBase()}`,
 					`  目录: ${catalog.current().length} 个模型`,
 					...lines,
+					...transportLines(),
 				].join("\n"),
 				"info",
 			);

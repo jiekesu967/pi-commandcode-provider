@@ -22,6 +22,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { createCommandCodeFetch, type TransportSettings } from "./net.ts";
 import { systemTextFor, toCliMessages, toOpenAiMessages, toolsFor } from "./convert.ts";
 import {
 	buildCliBody,
@@ -67,8 +68,35 @@ export interface StreamDeps {
 	streamIdleTimeoutMs: () => number;
 	/** Head-of-request timeout in milliseconds. */
 	requestTimeoutMs: () => number;
+	/**
+	 * Transport tuning (edge pinning, keep-alive, retries). Optional so a
+	 * host that only cares about the wire protocol keeps working; absent means
+	 * the transport's own defaults.
+	 */
+	transport?: () => TransportSettings;
 	/** The `x-command-code-version` value to send; refreshed from npm. */
 	cliVersion: () => string;
+}
+
+/**
+ * One transport per deps object, so its keep-alive socket pool survives from
+ * one turn of an agent loop to the next. That reuse is the point: without it
+ * every turn re-pays a TLS handshake, worth 0.34–1.44s on a consumer uplink.
+ */
+const transports = new WeakMap<StreamDeps, typeof fetch>();
+
+function transportFor(deps: StreamDeps): typeof fetch {
+	const cached = transports.get(deps);
+	if (cached !== undefined) return cached;
+	const settings = (): TransportSettings => {
+		const fromPlugin = deps.transport?.() ?? {};
+		// The caller's head-of-request budget stays authoritative unless the
+		// plugin passed an explicit one.
+		return { ...fromPlugin, headersTimeoutMs: fromPlugin.headersTimeoutMs ?? deps.requestTimeoutMs() };
+	};
+	const impl = createCommandCodeFetch(settings);
+	transports.set(deps, impl);
+	return impl;
 }
 
 /** Mutable accumulator while a stream is assembled. */
@@ -146,6 +174,10 @@ export function initialTransport(deps: StreamDeps, apiKey: string, isGoTier: boo
  * its headers have arrived. A non-2xx response is returned as facts rather
  * than thrown, because the caller has to classify it (the Go-plan gate is a
  * 403 that means "retry the other transport", not "fail").
+ *
+ * The connect timeout, the head-of-request budget, edge pinning, socket
+ * reuse and the connection-phase retries all live in the transport
+ * ({@link ./net.ts}), so this function only deals with the HTTP outcome.
  */
 async function connect(
 	deps: StreamDeps,
@@ -156,49 +188,18 @@ async function connect(
 	signal: AbortSignal | undefined,
 ): Promise<{ response: Response } | { status: number; bodyText: string; retryAfterMs?: number }> {
 	const endpoint = endpointFor(transport, apiBase);
-	const connectAbort = new AbortController();
-	let connectTimedOut = false;
-	const timeoutMs = deps.requestTimeoutMs();
-	const timer = setTimeout(() => {
-		connectTimedOut = true;
-		connectAbort.abort(new Error(`Command Code API 请求超时（${timeoutMs}ms）`));
-	}, timeoutMs);
-	const onCallerAbort = () => connectAbort.abort(signal?.reason);
-	if (signal) {
-		if (signal.aborted) onCallerAbort();
-		else signal.addEventListener("abort", onCallerAbort, { once: true });
-	}
-	const cleanup = () => {
-		clearTimeout(timer);
-		signal?.removeEventListener("abort", onCallerAbort);
-	};
-
-	let response: Response;
-	try {
-		response = await fetch(endpoint, {
-			method: "POST",
-			headers:
-				transport === "cli"
-					? cliHeaders(apiKey, deps.workingDir(), deps.cliVersion())
-					: openAiHeaders(apiKey),
-			body: JSON.stringify(body),
-			signal: connectAbort.signal,
-		});
-		clearTimeout(timer);
-	} catch (error) {
-		cleanup();
-		if (signal?.aborted) throw error;
-		const reason = error instanceof Error ? error.message : String(error);
-		throw new Error(
-			connectTimedOut
-				? `Command Code API 请求 ${endpoint} 在 ${timeoutMs}ms 内未收到响应（超时）：${reason}；request to ${endpoint} timed out`
-				: `Command Code API 请求 ${endpoint} 连接失败：${reason}；request to ${endpoint} failed`,
-		);
-	}
+	const response = await transportFor(deps)(endpoint, {
+		method: "POST",
+		headers:
+			transport === "cli"
+				? cliHeaders(apiKey, deps.workingDir(), deps.cliVersion())
+				: openAiHeaders(apiKey),
+		body: JSON.stringify(body),
+		signal,
+	});
 
 	if (!response.ok) {
 		const bodyText = await response.text().catch(() => "");
-		cleanup();
 		const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
 		return retryAfterMs === undefined
 			? { status: response.status, bodyText }

@@ -195,10 +195,14 @@ export class CatalogClient {
 	private models: CatalogModel[] = [];
 	private readonly apiBase: () => string;
 	private readonly cachePath: () => string;
+	private readonly fetchImpl: typeof fetch;
 
-	constructor(apiBase: () => string, cachePath: () => string) {
+	constructor(apiBase: () => string, cachePath: () => string, fetchImpl?: typeof fetch) {
 		this.apiBase = apiBase;
 		this.cachePath = cachePath;
+		// The catalog is on the same origin as the model requests, so it goes
+		// through the same pinned transport rather than system DNS.
+		this.fetchImpl = fetchImpl ?? fetch;
 	}
 
 	/** The last successfully loaded catalog, synchronously. */
@@ -224,7 +228,7 @@ export class CatalogClient {
 		if (!options?.force && this.models.length > 0) return this.models;
 		try {
 			const base = this.apiBase().replace(/\/+$/, "");
-			const response = await fetch(`${base}/provider/v1/models`, {
+			const response = await this.fetchImpl(`${base}/provider/v1/models`, {
 				headers: { accept: "application/json" },
 				signal: options?.signal ?? AbortSignal.timeout(CONTROL_TIMEOUT_MS),
 			});

@@ -1,6 +1,6 @@
 {
   "name": "pi-commandcode-provider",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Unofficial Command Code provider for pi, including the Go-plan CLI transport, browser login, and the Command Code web search / web fetch tools.",
   "type": "module",
@@ -31,6 +31,7 @@
   "scripts": {
     "test": "node tests/run-tests.mjs",
     "test:smoke": "node tests/run-tests.mjs smoke",
+    "test:transport": "node tests/run-tests.mjs transport",
     "test:routing": "node tests/run-tests.mjs routing",
     "test:login": "node tests/run-tests.mjs login",
     "test:migration": "node tests/run-tests.mjs migration",

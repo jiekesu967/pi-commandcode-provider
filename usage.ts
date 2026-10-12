@@ -167,10 +167,14 @@ function classifyTotalFailure(
 export class UsageClient {
 	private readonly apiBase: () => string;
 	private readonly cliVersion: () => string;
+	private readonly fetchImpl: typeof fetch;
 
-	constructor(apiBase: () => string, cliVersion: () => string) {
+	constructor(apiBase: () => string, cliVersion: () => string, fetchImpl?: typeof fetch) {
 		this.apiBase = apiBase;
 		this.cliVersion = cliVersion;
+		// Same origin as the model, so the usage panel benefits from the same
+		// pinned edge instead of system DNS.
+		this.fetchImpl = fetchImpl ?? fetch;
 	}
 
 	private async fetchJson(
@@ -178,7 +182,7 @@ export class UsageClient {
 		apiKey: string,
 	): Promise<{ status: number; record?: Record<string, unknown> }> {
 		const base = this.apiBase().replace(/\/+$/, "");
-		const response = await fetch(`${base}${path}`, {
+		const response = await this.fetchImpl(`${base}${path}`, {
 			headers: accountHeaders(apiKey, this.cliVersion()),
 			signal: AbortSignal.timeout(CONTROL_TIMEOUT_MS),
 		});

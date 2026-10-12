@@ -11,6 +11,22 @@ which in turn was ported from [`patlux/pi-commandcode-provider`](https://github.
 
 Install it as a pi package (`pi install`); after changing the sources, hot-reload with `/reload`.
 
+## What's new in 0.3.0
+
+- **A direct-connection transport (`net.ts`)** — the slowness and the timeouts on a line without a
+  proxy come from the path, not the model: Cloudflare edges differ by one to two orders of magnitude
+  in throughput, every request re-paid a TLS handshake, and a connection-phase hiccup was reported as
+  a plain failure. A background edge probe, a keep-alive pool and connection-phase retries now handle
+  all three; measured first-byte time dropped by about 0.5 s per request.
+  See [Direct-connection speedups](#direct-connection-speedups-edge-selection-socket-reuse-retries).
+- **Timeouts split in two**: `connectTimeoutMs` (establishing) and `requestTimeoutMs` (waiting for
+  response headers), the first retryable, the second not; `/commandcode-status` prints the current
+  edge ranking and the socket pool.
+- **`COMMANDCODE_TRANSPORT_LOG`** appends one line per attempt (`edge`, `reused`, `connectMs`, `ms`)
+  so the pin and the reuse can be checked inside a real pi process.
+- **New suites**: `npm run test:transport` (offline mock) and `npm run test:transport-live`
+  (real gateway A/B, manual, spends quota).
+
 ## What's new in 0.2.0
 
 - **Web search and page fetching** — `cc_search` / `cc_fetch`, running on the same subscription key
@@ -219,6 +235,80 @@ restores the exports all keep using upstream automatically; only the gap uses th
 > `normalizeContext()` and passes `{systemPrompt, tools}` directly exercises a shape no real request
 > has — which is how this bug survived until it hit production.
 
+## Direct-connection speedups: edge selection, socket reuse, retries
+
+`api.commandcode.ai` sits behind Cloudflare and this plugin runs on the user's own machine, over a
+consumer uplink. Three properties of that path made requests slow, or made them fail outright.
+`net.ts` addresses each:
+
+**1. Which Cloudflare edge you land on.** Under anycast one address can be "close" and another
+"far away or rate-shaped", and the ranking drifts over time. Measured on one line: a 5MB download
+through one address ran at **122 KB/s** (40 seconds) where another did **3–4 MB/s**; first-byte time
+ranged from 0.30 s to 2.07 s. The plugin therefore probes candidates **in the background** and pins
+the best one through a custom DNS `lookup` — no hosts-file edit, no elevation.
+
+The ranking is deliberately **not** first-byte time alone: every candidate gets a cheap TLS+first-byte
+probe, the fastest three then each download 256KB to measure **sustained throughput**, and the final
+order is by predicted time to move 256KB (first byte + transfer). First byte alone is not enough —
+the best handshake on the line can be the worst path for bytes, and that is the failure mode behind
+"the answer just crawls". A candidate whose throughput could not be measured is charged a
+conservative 150 KB/s, so it can never outrank a measured one by accident; a measured rate under
+120 KB/s is not eligible at all.
+
+**2. A fresh TLS handshake per request.** pi's own dispatcher never sets a `keepAliveTimeout`, so
+undici's 4-second default drops the connection between two turns of an agent loop — and turns are
+usually more than 4 seconds apart, so every turn re-handshakes. Measured cost of that handshake:
+**170–430 ms** depending on the edge. The plugin uses a keep-alive pool with a long idle window;
+measured inside a real pi process, a turn with three model requests is **1 handshake + 2 reuses**.
+
+**3. A connection-phase hiccup used to be reported as a failure.** One RST surfaced as
+"在 60000ms 内未收到响应（超时）" although the request had barely started. Connection-phase failures
+(handshake failure, connection reset, connect timeout, refused) are now retried, each on a different
+edge. Failures *after* response headers are not retried — the request may be generating a long answer
+and a replay would pay for two. A failure before any response header cannot have produced a result the
+caller has seen, so a replay carries no risk of duplicating one.
+
+Deliberate limits:
+
+- With a proxy configured (`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`) the request still goes to pi's
+  own dispatcher, exactly as before; only direct connections use the pinning.
+- It applies to the Command Code API hostname only. A self-hosted `apiBase`, or a test server on
+  loopback, keeps system DNS and no retries — your own gateway is never resolved to Cloudflare.
+- HTTP/1.1 only (matching undici); no HTTP/2.
+- Probing is background-only and never sits on the request path; the first request of a session
+  starts a round.
+
+### Measured (same line, same key, real gateway)
+
+| Metric | Before | After |
+|---|---|---|
+| First byte per request (median TTFB) | 1895 ms | 1405 ms (**-490 ms, 1.35x**) |
+| of which: socket reuse | — | **-432 ms** (same edge, warm vs cold socket) |
+| of which: edge choice | — | -58 ms (this run; edge quality drifts, so it can be far larger) |
+| Handshakes for a 3-request turn | 3 | **1** (measured inside a real pi process) |
+| Connection-phase hiccup | reported as a timeout | retried on another edge (up to 2) |
+
+Reproduce it with `npm run test:transport-live`; `npm run test:transport` is the offline version
+(a mock server, no network, no quota).
+
+> Whole-run wall time is dominated by model thinking time (the same prompt varied by two seconds
+> between runs), so judging this work by it only produces noise. That is exactly why the acceptance
+> numbers here are transport-level: first byte and handshake counts.
+
+### Observability
+
+`/commandcode-status` now prints the current edge ranking, quarantined addresses, the socket pool
+(reused/in use) and the connection policy. To check from outside the process, set
+`COMMANDCODE_TRANSPORT_LOG=<file>`: every attempt appends one JSON line (`edge`, `reused`,
+`connectMs`, `ms`, or `kind`/`code` on failure). Unset, it costs nothing.
+
+```
+$env:COMMANDCODE_TRANSPORT_LOG="G:\tmp\cc-transport.log"
+pi --provider commandcode --model deepseek/deepseek-v4.1-flash "run bash"
+# {"endpoint":"…/chat/completions","edge":"104.18.32.1","attempt":1,"outcome":"ok","reused":false,"connectMs":171,"ms":1729}
+# {"endpoint":"…/chat/completions","edge":"104.18.32.1","attempt":1,"outcome":"ok","reused":true,"connectMs":1,"ms":1386}
+```
+
 ## Web search and page fetching
 
 Command Code's official CLI has two built-in web tools, and both are reachable with the **same
@@ -346,8 +436,15 @@ Everything lives under the `commandcode` section of `~/.pi/agent/settings.json`;
     "filterModelsByPlan": true,
     "visibleModels": [],
     "modelsCachePath": "~/.commandcode/models-cache.json",
-    "requestTimeoutMs": 60000,
-    "streamIdleTimeoutMs": 300000
+    "requestTimeoutMs": 120000,
+    "streamIdleTimeoutMs": 300000,
+    "connectTimeoutMs": 15000,
+    "connectRetries": 2,
+    "keepAliveMs": 300000,
+    "edgePinning": true,
+    "edgeProbe": true,
+    "edgeProbeThroughput": true,
+    "edgeRefreshMs": 7200000
   }
 }
 ```
@@ -362,12 +459,27 @@ Everything lives under the `commandcode` section of `~/.pi/agent/settings.json`;
 - **`filterModelsByPlan`**: defaults to `true` and hides models the current plan cannot use (judged
   by billing tier); anything uncertain stays visible, and the server has the final say.
 
+### Direct-connection transport keys
+
+| Key | Default | Meaning |
+|---|---|---|
+| `requestTimeoutMs` | `60000` | request sent → **response headers** budget. Worth raising for large contexts and long thinking (the reference install uses `120000`). Never retried: the server may well be generating |
+| `connectTimeoutMs` | `15000` | budget for one TCP+TLS establishment (retryable) |
+| `connectRetries` | `2` | retries after a connection-phase failure, each on another edge |
+| `keepAliveMs` | `300000` | how long an idle socket is held open — decides whether the next turn re-handshakes |
+| `edgePinning` | `true` | pin to the best-scoring edge; set `false` to use system DNS |
+| `edgeIps` | 14 built-ins | your own candidate list, replacing the built-in one (handy to force one IP) |
+| `edgeHosts` | — | extra hostnames pinning may touch (default: `api.commandcode.ai` only) |
+| `edgeProbe` / `edgeProbeThroughput` | `true` | background probing of edge quality / whether throughput is measured too |
+| `edgeRefreshMs` | `7200000` | how long a ranking is trusted (2 h rounds, roughly 3×256KB of traffic each) |
+| `throughputUrl` | Cloudflare's speed endpoint | target URL for the throughput measurement |
+
 ## Commands and panels
 
 | Command / shortcut | Effect |
 |---|---|
 | `/commandcode` | usage per account, plan, 5-hour / weekly windows |
-| `/commandcode-status` | account status and the transport in use (`openai` / `cli` / auto) |
+| `/commandcode-status` | account status, the transport in use (`openai` / `cli` / auto), plus the edge ranking, socket pool and retry policy |
 | `/commandcode-models` | force a refresh of the model catalogue |
 | `/commandcode-login` | save an API key |
 | `/commandcode-search` | registration, endpoints, cache and last call for the web tools; `on` / `off` / `fetch on` / `fetch off` / `cache` |
@@ -386,6 +498,7 @@ Every model in the picker carries capability annotations: plan tier, `FREE`/disc
 | `convert.ts` | pi messages → both wire formats (tool calls, long ids, images inside tool results) |
 | `transcript-compat.ts` | `getCurrentSystemPrompt` / `getCurrentTools` with a local fallback, for pi builds whose packaged compat entry does not export them |
 | `stream.ts` | streaming engine: transport fallback, event assembly, account rotation |
+| `net.ts` | direct-connection transport: edge selection (two-stage first-byte + throughput probe), keep-alive socket pool, connection-phase retries, proxy fallback |
 | `login.ts` | browser login: loopback callback, state validation, whoami verification, persistence |
 | `accounts.ts` | account pool: credential resolution, rotation state, per-model routing |
 | `catalog.ts` | live model catalogue, disk cache, capability annotations, plan filtering |
@@ -407,8 +520,9 @@ Re-run it whenever a Command Code release changes models, plans, or pricing.
 ## Tests
 
 ```
-npm test                  # everything (111 checks)
-npm run test:smoke        # a single suite
+npm test                    # every suite
+npm run test:smoke          # a single suite
+npm run test:transport      # the direct-connection transport (offline mock)
 ```
 
 You can also run `node tests/run-tests.mjs [prefix]` directly.
@@ -416,6 +530,7 @@ You can also run `node tests/run-tests.mjs [prefix]` directly.
 | Suite | Coverage |
 |---|---|
 | `smoke-test.ts` | pure functions: wire parsing, Go-gate detection (including the stale-version counterexample), credentials, catalogue, capability annotations |
+| `transport-test.ts` | the direct-connection transport against a **local mock server**: keep-alive reuse (three requests, one connection), replay after a reset connection, no retry once a response arrived, no retry on a header timeout, the connect-timeout message, refused connections, status/header/body pass-through, abort propagation (no retry), proxy fallback, edge ranking and quarantine, retry classification, throughput-aware scoring |
 | `routing-test.ts` | per-model account routing and fallback behaviour |
 | `login-test.ts` | **the whole browser-login path**: a real loopback HTTP server plus a simulated browser callback; forged state, missing fields, 405/404, invalid keys not persisted, denied authorisation, timeout, cancellation, occupied ports skipped, both stores written |
 | `migration-test.ts` | migrating an existing key into pi's credential store at startup: migration, no-ops (pi already has a key / env var supplies one), other providers preserved, empty and corrupt files |
@@ -425,14 +540,16 @@ You can also run `node tests/run-tests.mjs [prefix]` directly.
 | `live-gateway-test.ts` | the **real production gateway**: catalogue reachable, both endpoints present, CLI envelope accepted by the server's schema |
 | `loop-live.ts` | **real gateway, real key, two-turn tool loop** (manual; never part of `npm test`, spends quota): normalized context → structured tool call → tool result fed back → closing answer. Run with `npm run test:loop` |
 | `live-search-test.ts` | **real gateway, real key, the web tools** (manual; never part of `npm test`, spends quota): a live search returning citable absolute URLs, `allowedDomains` constraining the index, a server-side page fetch coming back as readable text, and the clamped `numResults`. Run with `npm run test:live-search` |
+| `transport-live.ts` | **real-gateway transport A/B** (manual; never part of `npm test`, spends quota): round-by-round, "pinned edge + warm socket" against `globalThis.fetch` (what pi did before), splitting the gain into edge choice and socket reuse. Run with `npm run test:transport-live` |
 
 `stream-test.ts` / `live-gateway-test.ts` need the types from `@earendil-works/pi-ai`; pi injects
 them at runtime but a bare node run cannot resolve them, so `run-tests.mjs` creates a junction
 temporarily and removes it afterwards — none of that ships with the plugin.
 
 > `loop-live.ts` is marked `manual`, so `npm test` skips it; only an explicit `npm run test:loop`
-> runs it. `live-search-test.ts` is marked the same way and takes `npm run test:live-search`. Both
-> talk to the production gateway with your own credentials — mind your quota.
+> runs it. `live-search-test.ts` and `transport-live.ts` are marked the same way and take
+> `npm run test:live-search` / `npm run test:transport-live`. All three talk to the production
+> gateway with your own credentials — mind your quota.
 
 > **Known gap**: a human actually authorising in a browser — the tests simulate the callback over
 > HTTP, covering everything except the browser genuinely opening and logging in.
@@ -454,6 +571,23 @@ pi --provider commandcode --model deepseek/deepseek-v4.1-flash "run something in
 
 Zero cost when the variable is unset, and a failed capture never affects the request. This is what
 pinned the bug above: `tools: []` and `system: ""` were visible at a glance.
+
+### Debugging: checking the transport
+
+Which edge a request was pinned to, and whether it reused a socket, is invisible in the logs, so
+there is a channel that records transport facts only. Point `COMMANDCODE_TRANSPORT_LOG` at a file and
+every attempt appends one JSON line: `reused: true` means the request rode an existing connection
+(no handshake paid), and `connectMs` is the handshake it did pay.
+
+```
+$env:COMMANDCODE_TRANSPORT_LOG="G:\tmp\cc-transport.log"
+pi --provider commandcode --model deepseek/deepseek-v4.1-flash "run something in bash"
+```
+
+In the TUI, `/commandcode-status` prints the same picture: the current edge ranking, the quarantined
+addresses and the socket pool. To force one address, set `"edgeIps": ["104.18.32.1"]`; to turn the
+whole thing off — for instance because a hosts-file pin already suits you — set
+`"edgePinning": false` and system DNS is used instead.
 
 ## Uninstall
 

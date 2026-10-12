@@ -32,6 +32,7 @@ const PI_PACKAGES = join(PI_PACKAGE_ROOT, "node_modules", "@earendil-works");
 
 const SUITES = [
 	{ prefix: "smoke", file: "smoke-test.ts", needsLink: true },
+	{ prefix: "transport", file: "transport-test.ts", needsLink: false },
 	{ prefix: "routing", file: "routing-test.ts", needsLink: false },
 	{ prefix: "login", file: "login-test.ts", needsLink: false },
 	{ prefix: "migration", file: "migration-test.ts", needsLink: false },
@@ -42,6 +43,8 @@ const SUITES = [
 	// Opt-in: talks to the real gateway with your own key and spends quota, so
 	// it runs only when named explicitly (`node run-tests.mjs loop`).
 	{ prefix: "loop", file: "loop-live.ts", needsLink: true, manual: true },
+	// Same, for the transport A/B: `node run-tests.mjs transport-live`.
+	{ prefix: "transport-live", file: "transport-live.ts", needsLink: false, manual: true },
 	// Same, for the web tools: `node run-tests.mjs live-search`.
 	{ prefix: "live-search", file: "live-search-test.ts", needsLink: true, manual: true },
 ];

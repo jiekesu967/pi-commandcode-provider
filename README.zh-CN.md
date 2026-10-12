@@ -8,6 +8,19 @@
 
 作为 pi 包安装（`pi install`）。改动源码后用 `/reload` 热重载。
 
+## 0.3.0 新增
+
+- **直连传输层（`net.ts`）** —— 不挂代理时的慢与超时，根因在链路上而不是模型：Cloudflare
+  边缘节点之间吞吐差 1–2 个数量级、每个请求重复一次 TLS 握手、连接期抖动直接报错。现在由
+  后台优选节点 + keep-alive 连接池 + 连接期重试处理，实测每请求首字 TTFB 立减约 0.5s。
+  见[直连加速](#直连加速边缘节点优选连接复用与重试)。
+- **超时分工**：`connectTimeoutMs`（建立连接）与 `requestTimeoutMs`（等到响应头）分开，
+  前者可重试、后者不重试；`/commandcode-status` 会打印当前节点排序与连接池。
+- **`COMMANDCODE_TRANSPORT_LOG`**：把每次尝试的 `edge` / `reused` / `connectMs` / `ms`
+  逐行追加到文件，用来在真实 pi 进程里核对复用与优选是否生效。
+- **新套件**：`npm run test:transport`（离线 mock）与 `npm run test:transport-live`
+  （真实网关 A/B，手动，耗额度）。
+
 ## 0.2.0 新增
 
 - **联网搜索与网页抓取** —— `cc_search` / `cc_fetch`，用模型已经在用的同一把订阅密钥，带
@@ -185,6 +198,70 @@ too" 这条回归测试盯的就是这个：它按 pi 的方式先 `normalizeCon
 > `normalizeContext()` 而直接传 `{systemPrompt, tools}`，测的就是一个真实世界里不存在的形状 ——
 > 本插件最初正是这样测的，所以这个 bug 一路活到了线上。
 
+## 直连加速：边缘节点优选、连接复用与重试
+
+`api.commandcode.ai` 在 Cloudflare 后面，而这个插件跑在用户自己的机器上、走家宽出口。
+在那条链路上有三件事会让请求变慢或者直接失败，`net.ts` 逐条处理：
+
+**1. 落哪个 Cloudflare 边缘节点。** Anycast 之下同一个域名可以从"很近"变成"很远或被限速"，
+而且排序会随时间漂移。实测同一条线路：一个地址下载 5MB 只有 **122 KB/s**（要 40 秒），另一个有
+**3–4 MB/s**；首字时间也能从 0.30s 变到 2.07s。所以插件在**后台**探测候选地址并钉住最好的那个，
+通过自定义 DNS `lookup` 实现 —— 既不用改 hosts，也不需要管理员权限。
+
+排序**不是**只看首字时间：先全量测 TLS + 首字（便宜），再对最快的 3 个候选各下载 256KB 测
+**持续吞吐**，最后按"传完 256KB 的预测耗时"（首字 + 传输）排序。只测首字是不够的 ——
+首字最快的地址完全可能是吞吐最差的那个，而后者才是"响应慢"的真正来源。吞吐测不出来的候选
+按保守速率（150 KB/s）估算，所以不会凭空压过已实测的地址；实测速率低于 120 KB/s 的直接不进
+候选。
+
+**2. 每个请求重做一次 TLS 握手。** pi 自己的 dispatcher 从没设过 `keepAliveTimeout`，undici
+默认 4 秒就丢掉连接 —— 而代理循环里两轮之间通常超过 4 秒，于是每一轮都重新握手。实测这一次
+握手值 **170–430ms**（取决于节点）。插件改用长空闲窗口的 keep-alive 连接池，在真实 pi 进程里
+实测：一轮 3 次模型请求 = **1 次握手 + 2 次复用**。
+
+**3. 连接期抖动直接报错。** 一次 RST 以前会变成「在 60000ms 内未收到响应（超时）」，
+尽管请求才刚开始。现在**连接期**失败（握手失败、连接被重置、连接超时、拒绝连接）会自动重试，
+每次换一个节点；已经收到响应头之后的失败**不**重试 —— 请求可能正在生成长回答，重放会为两次
+付费。而在收到响应头之前就失败，说明调用方不可能看到任何结果，重放没有重复的风险。
+
+几个刻意的边界：
+
+- 配置了代理（`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`）时，请求仍然交给 pi 自己的
+  dispatcher 走代理，行为与以前完全一致；只有直连才走这套优选。
+- 只对 Command Code 的 API 主机名生效。`apiBase` 指向自建反代、或测试跑在回环地址上时，
+  走系统 DNS、不重试 —— 不会把你的自建网关解析到 Cloudflare 去。
+- 只走 HTTP/1.1（与 undici 一致），不引入 HTTP/2。
+- 探测只在后台做，永远不挡在请求路径上；每个会话的第一次请求就会起一轮探测。
+
+### 实测（同一条线路、同一把密钥、真实网关）
+
+| 指标 | 改动前 | 改动后 |
+|---|---|---|
+| 每请求首字 TTFB（中位） | 1895 ms | 1405 ms（**-490ms，1.35x**） |
+| 其中：连接复用贡献 | — | **-432ms**（同一节点，热连接 vs 冷连接） |
+| 其中：节点优选贡献 | — | -58ms（本次实测；节点质量按时段漂移，可能高得多） |
+| 一轮 3 次模型请求的握手次数 | 3 | **1**（真实 pi 进程内实测） |
+| 连接期抖动 | 直接报超时 | 换节点自动重试（最多 2 次） |
+
+`npm run test:transport-live` 可以自己复现这张表；`npm run test:transport` 是离线版本
+（mock 服务器，不联网、不耗额度）。
+
+> 整轮对话的**墙钟时间**被模型思考时间盖住（同一提示在不同轮之间能差 2 秒），拿它做验收
+> 只会得出噪声结论 —— 这正是这套改动值得用传输层指标（首字、握手次数）验收的原因。
+
+### 观测
+
+`/commandcode-status` 现在会打印当前边缘排序、被隔离的地址、连接池（复用/在用）与连接策略。
+想在进程外核对，设 `COMMANDCODE_TRANSPORT_LOG=<文件>`：每次尝试追加一行 JSON
+（`edge` / `reused` / `connectMs` / `ms`，失败则带 `kind` / `code`），不设该变量时零开销。
+
+```
+$env:COMMANDCODE_TRANSPORT_LOG="G:\tmp\cc-transport.log"
+pi --provider commandcode --model deepseek/deepseek-v4.1-flash "跑一下 bash"
+# {"endpoint":"…/chat/completions","edge":"104.18.32.1","attempt":1,"outcome":"ok","reused":false,"connectMs":171,"ms":1729}
+# {"endpoint":"…/chat/completions","edge":"104.18.32.1","attempt":1,"outcome":"ok","reused":true,"connectMs":1,"ms":1386}
+```
+
 ## 联网搜索与网页抓取
 
 Command Code 官方 CLI 自带两个网页工具，用的就是模型已经在用的**同一个订阅密钥** —— 不需要另配
@@ -302,8 +379,15 @@ pi 对同名工具**只保留第一次注册**，之后的静默忽略；两个�
     "filterModelsByPlan": true,
     "visibleModels": [],
     "modelsCachePath": "~/.commandcode/models-cache.json",
-    "requestTimeoutMs": 60000,
-    "streamIdleTimeoutMs": 300000
+    "requestTimeoutMs": 120000,
+    "streamIdleTimeoutMs": 300000,
+    "connectTimeoutMs": 15000,
+    "connectRetries": 2,
+    "keepAliveMs": 300000,
+    "edgePinning": true,
+    "edgeProbe": true,
+    "edgeProbeThroughput": true,
+    "edgeRefreshMs": 7200000
   }
 }
 ```
@@ -316,12 +400,27 @@ pi 对同名工具**只保留第一次注册**，之后的静默忽略；两个�
 - **`filterModelsByPlan`**：默认 `true`，隐藏当前套餐用不到的模型（按账单档位判断）；
   任何不确定的情况都放开显示，最终以服务端为准。
 
+### 直连传输相关
+
+| 键 | 默认值 | 含义 |
+|---|---|---|
+| `requestTimeoutMs` | `60000` | 发出请求 → 收到**响应头**的预算。大上下文、长思考的模型值得调大（本机配的是 `120000`）。服务端已经在生成时不会重试它 |
+| `connectTimeoutMs` | `15000` | 单次 TCP+TLS 建立的预算（可重试） |
+| `connectRetries` | `2` | 连接期失败后的重试次数，每次换一个节点 |
+| `keepAliveMs` | `300000` | 空闲连接保持多久 —— 决定下一轮要不要重新握手 |
+| `edgePinning` | `true` | 是否钉住优选节点；关掉就走系统 DNS |
+| `edgeIps` | 内置 14 个 | 自己指定候选地址（覆盖内置列表，可用于手动钉死某个 IP） |
+| `edgeHosts` | — | 额外允许优选的域名（默认只有 `api.commandcode.ai`） |
+| `edgeProbe` / `edgeProbeThroughput` | `true` | 后台探测节点质量 / 是否连吞吐一起测 |
+| `edgeRefreshMs` | `7200000` | 排序的保鲜期（默认 2 小时一轮，每轮约 3×256KB 流量） |
+| `throughputUrl` | Cloudflare 测速端点 | 吞吐探测的目标 URL（可换成自建镜像） |
+
 ## 命令与面板
 
 | 命令 / 快捷键 | 作用 |
 |---|---|
 | `/commandcode` | 各账户用量、套餐、5 小时 / 每周窗口 |
-| `/commandcode-status` | 账户状态与当前使用的传输（`openai` / `cli` / 自动） |
+| `/commandcode-status` | 账户状态、当前传输（`openai` / `cli` / 自动），以及边缘节点排序、连接池与重试策略 |
 | `/commandcode-models` | 强制刷新模型目录 |
 | `/commandcode-login` | 保存 API key |
 | `/commandcode-search` | 联网工具的注册状态、端点、缓存与最近一次调用；`on` / `off` / `fetch on` / `fetch off` / `cache` |
@@ -340,6 +439,7 @@ pi 对同名工具**只保留第一次注册**，之后的静默忽略；两个�
 | `convert.ts` | pi 消息 → 两种线格式（适配工具调用、长 id、工具结果里的图片） |
 | `transcript-compat.ts` | `getCurrentSystemPrompt` / `getCurrentTools` 及本地兜底实现，应对 pi 打包发行版 compat 入口未导出这两个函数的版本 |
 | `stream.ts` | 流式引擎：传输降级、事件装配、账户轮换 |
+| `net.ts` | 直连传输层：边缘节点优选（首字 + 吞吐两阶段探测）、keep-alive 连接池、连接期重试、代理回退 |
 | `login.ts` | 浏览器登录：回环回调、state 校验、whoami 验证、落盘 |
 | `accounts.ts` | 账户池：凭据解析、轮换状态、按模型路由 |
 | `catalog.ts` | 实时模型目录、磁盘缓存、能力标注、套餐过滤 |
@@ -360,8 +460,9 @@ Command Code 发版后模型/套餐/价格有变动时重跑一次即可。
 ## 测试
 
 ```
-npm test                  # 全部（111 项）
+npm test                  # 全部套件
 npm run test:smoke        # 单个套件
+npm run test:transport    # 直连传输层（离线 mock）
 ```
 
 也可以直接 `node tests/run-tests.mjs [前缀]`。
@@ -369,6 +470,7 @@ npm run test:smoke        # 单个套件
 | 套件 | 覆盖 |
 |---|---|
 | `smoke-test.ts` | 纯函数：线协议解析、Go 门槛判定（含版本过期反例）、凭据、目录、能力标注 |
+| `transport-test.ts` | 直连传输层，跑在**本地 mock 服务器**上：keep-alive 复用（3 次请求只开 1 条连接）、连接被重置后的重放、已收到响应后不再重试、响应头超时不重试、连接超时的文案、连接被拒、状态/头/体透传、中止传播（不重试）、代理回退、边缘排序与隔离、重试分类、吞吐参与评分 |
 | `routing-test.ts` | 按模型路由账户、回落行为 |
 | `login-test.ts` | **浏览器登录全链路**：真实回环 HTTP + 模拟浏览器回调；state 伪造、字段缺失、405/404、无效密钥不落盘、拒绝授权、超时、取消、端口占用跳过、双存储写入 |
 | `migration-test.ts` | 启动时把既有密钥迁入 pi 凭据库：迁移、no-op（pi 已有钥/环境变量已供钥）、保留其他 provider、空钥与损坏文件 |
@@ -378,6 +480,7 @@ npm run test:smoke        # 单个套件
 | `live-gateway-test.ts` | **真实生产网关**：目录可达、两端点存在、CLI 信封通过服务端 schema 校验 |
 | `loop-live.ts` | **真实网关 + 真实密钥的两轮工具环**（手动，默认不跑，会计费/耗额度）：归一化上下文 → 结构化工具调用 → 回灌工具结果 → 收尾回答。`npm run test:loop` |
 | `live-search-test.ts` | **真实网关 + 真实密钥的联网工具实测**（手动，默认不跑，耗额度）：真实搜索返回可引用的绝对 URL、`allowedDomains` 确实约束索引、服务端抓取返回可读文本、`numResults` 夹取生效。`npm run test:live-search` |
+| `transport-live.ts` | **真实网关的传输 A/B**（手动，默认不跑，耗额度）：把「钉节点 + 热连接」与 `globalThis.fetch`（即 pi 改动前的行为）逐轮对比，并打印节点优选与连接复用各自的贡献。`npm run test:transport-live` |
 
 `stream-test.ts` / `live-gateway-test.ts` 需要 `@earendil-works/pi-ai` 的类型；运行时由 pi 注入，
 裸跑 node 解析不到，因此 `run-tests.mjs` 会临时建 junction、跑完自行清理 —— 这些都不会随插件发布。
@@ -406,6 +509,21 @@ pi --provider commandcode --model deepseek/deepseek-v4.1-flash "调一下 bash"
 
 不带这个变量时零开销；抓包失败也绝不会影响请求本身。这也是当初定位"模型把工具调用写成文本"
 所用的手段：请求体里 `tools: []` + `system: ""` 一眼可见。
+
+### 排障：核对直连传输
+
+"到底钉在哪个节点、有没有复用连接"光看日志看不出来，所以另有一个只记传输事实的通道：
+`COMMANDCODE_TRANSPORT_LOG` 指向一个文件，每次尝试追加一行 JSON。`reused: true` 表示这次
+请求骑在已建立的连接上（没有付握手），`connectMs` 是这次付掉的握手时间。
+
+```
+$env:COMMANDCODE_TRANSPORT_LOG="G:\tmp\cc-transport.log"
+pi --provider commandcode --model deepseek/deepseek-v4.1-flash "跑一下 bash"
+```
+
+交互模式里也可以直接 `/commandcode-status`：它打印当前边缘排序、被隔离的地址与连接池
+复用/在用数量。想手动钉死某个节点就在配置里写 `"edgeIps": ["104.18.32.1"]`；想关掉整套
+优选写 `"edgePinning": false`（回到系统 DNS，比如你已经用 hosts 固定了 IP）。
 
 ## 卸载
 
