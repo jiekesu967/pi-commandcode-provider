@@ -11,6 +11,21 @@ which in turn was ported from [`patlux/pi-commandcode-provider`](https://github.
 
 Install it as a pi package (`pi install`); after changing the sources, hot-reload with `/reload`.
 
+## What's new in 0.4.0
+
+- **Verified against pi 1.4.0** (was 1.0.x), and the picker now offers **model-accurate thinking
+  levels**: every model gets a `thinkingLevelMap` built from the CLI's own effort list, so `xhigh`
+  and `max` are reachable where Command Code supports them instead of being hidden behind pi's
+  defaults.
+- **An effort carried over from another model is clamped, not forwarded.** Command Code accepts an
+  unsupported but legal level with HTTP 200 while silently running at default depth, so forwarding it
+  made the setting look ignored. Confirmed against the live API.
+- **Background work no longer touches a torn-down extension**: `register()` swallows the
+  stale-instance throw raised by late catalog refreshes, tier probes and login continuations (it used
+  to escape as an unhandled rejection), and the catalogue-failure warning now registers its
+  `session_start` handler synchronously.
+- See [Supported pi versions](#supported-pi-versions).
+
 ## What's new in 0.3.0
 
 - **A direct-connection transport (`net.ts`)** — the slowness and the timeouts on a line without a
@@ -548,7 +563,7 @@ You can also run `node tests/run-tests.mjs [prefix]` directly.
 
 | Suite | Coverage |
 |---|---|
-| `smoke-test.ts` | pure functions: wire parsing, Go-gate detection (including the stale-version counterexample), credentials, catalogue, capability annotations |
+| `smoke-test.ts` | pure functions: wire parsing, Go-gate detection (including the stale-version counterexample), credentials, catalogue, capability annotations, per-model reasoning-effort mapping |
 | `transport-test.ts` | the direct-connection transport against a **local mock server**: keep-alive reuse (three requests, one connection), replay after a reset connection, no retry once a response arrived, no retry on a header timeout, the connect-timeout message, refused connections, status/header/body pass-through, abort propagation (no retry), proxy fallback, edge ranking and quarantine, retry classification, throughput-aware scoring |
 | `routing-test.ts` | per-model account routing and fallback behaviour |
 | `login-test.ts` | **the whole browser-login path**: a real loopback HTTP server plus a simulated browser callback; forged state, missing fields, 405/404, invalid keys not persisted, denied authorisation, timeout, cancellation, occupied ports skipped, both stores written |
