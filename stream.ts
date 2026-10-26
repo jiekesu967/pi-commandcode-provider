@@ -23,6 +23,7 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { createCommandCodeFetch, type TransportSettings } from "./net.ts";
+import { clampEffort } from "./catalog.ts";
 import { systemTextFor, toCliMessages, toOpenAiMessages, toolsFor } from "./convert.ts";
 import {
 	buildCliBody,
@@ -589,7 +590,13 @@ export function streamCommandCode(
 
 			const modelMax = deps.modelMaxTokens(model.id) ?? model.maxTokens;
 			const maxTokens = Math.min(options?.maxTokens ?? model.maxTokens, modelMax);
-			const effort = options?.reasoning && options.reasoning !== "off" ? options.reasoning : undefined;
+			// The picker's level may have been chosen for a different model, so
+			// clamp it onto what THIS model accepts. Command Code silently
+			// accepts an unsupported-but-legal level (verified: `medium` on a
+			// high/max model returns 200) and then runs at default depth, which
+			// looks like the setting was ignored.
+			const requested = options?.reasoning && options.reasoning !== "off" ? options.reasoning : undefined;
+			const effort = requested === undefined ? undefined : clampEffort(model.id, requested);
 			// `/alpha/generate` caps output tokens well below the Provider API.
 			const cliMaxTokens = Math.min(maxTokens, CLI_MAX_OUTPUT_TOKENS);
 			const facts: RequestFacts = {

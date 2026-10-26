@@ -183,6 +183,23 @@ too" 这条回归测试盯的就是这个：它按 pi 的方式先 `normalizeCon
 
 #### 这两个 helper 在 pi 1.0 的打包发行版里根本取不到
 
+### 支持的 pi 版本
+
+针对 **pi 1.4.0**（`@earendil-works/pi-coding-agent`）开发并验证；在 1.0.x 上也能加载
+（下面那段 transcript 兼容层就是为缺失 pi-ai 辅助函数的打包发行版准备的）。
+
+本轮用到了两项宿主能力，均在 1.4.0 运行时实测确认：
+
+| 能力 | 为什么需要 |
+|---|---|
+| 模型上的 `thinkingLevelMap` | 缺了它 pi 会对每个推理模型都给出默认档位、并隐藏 `xhigh`/`max` —— 即使 Command Code 支持也选不到。 |
+| `@earendil-works/pi-ai/models` 子路径 | 暴露 `getSupportedThinkingLevels`，用于核对选择器与模型是否一致。 |
+
+推理档位现在按模型精确给出。Command Code 接受的档位比 pi 默认的更窄（部分模型只允许
+`high`/`max`），而且它对**合法但模型不支持**的档位会静默放行（HTTP 200）并按默认深度执行 ——
+于是「选了个档位却没生效」。现在插件为每个模型输出 `thinkingLevelMap`，并把跨模型带过来的
+档位夹取到该模型支持的最近一档，而不是原样发送。
+
 方向对了不等于拿得到。pi 1.0.0 实测：**打包发行版**通过虚拟模块把 `@earendil-works/pi-ai` 暴露给
 扩展，其 compat 入口只有 100 个导出，而磁盘上的 `dist/compat.js` 有 127 个；
 `getCurrentSystemPrompt` 与 `getCurrentTools` 正在缺失之列，`@earendil-works/pi-ai/utils/transcript`

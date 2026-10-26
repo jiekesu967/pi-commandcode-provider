@@ -33,8 +33,10 @@ import {
 	compareByPlan,
 	formatContext,
 	isFreeModel,
+	clampEffort,
 	modelVisibleInPlan,
 	parseCatalogResponse,
+	thinkingLevelMapFor,
 	peakPricingState,
 	planLabel,
 } from "../catalog.ts";
@@ -493,6 +495,65 @@ await test("extracts account identity from whoami", () => {
 	});
 	assert.deepEqual(parseAccountIdentity({}), {});
 	assert.deepEqual(parseAccountIdentity(undefined), {});
+});
+
+
+console.log("\nreasoning efforts");
+
+await test("maps each model to exactly the levels Command Code accepts", () => {
+	// A model that only accepts high/max must not advertise the others: pi
+	// derives its picker from this map, and a null hides the level.
+	assert.deepEqual(thinkingLevelMapFor("deepseek/deepseek-v4-pro"), {
+		minimal: null,
+		low: null,
+		medium: null,
+		high: "high",
+		xhigh: null,
+		max: "max",
+	});
+
+	// A wider list keeps every accepted level, including the extended ones.
+	const opus = thinkingLevelMapFor("claude-opus-5");
+	assert.equal(opus?.high, "high");
+	assert.equal(opus?.xhigh, "xhigh", "xhigh must be offered where supported");
+	assert.equal(opus?.max, "max");
+
+	// Unknown models get no map, so pi falls back to its own defaults rather
+	// than hiding every level.
+	assert.equal(thinkingLevelMapFor("some/unlisted-model"), undefined);
+});
+
+await test("never hides off, which means send no reasoning_effort", () => {
+	// `off` is absent from the map on purpose. pi treats an absent entry as
+	// supported, and omitting the field is what every model tolerates.
+	const map = thinkingLevelMapFor("deepseek/deepseek-v4-pro");
+	assert.ok(map !== undefined);
+	assert.equal("off" in map, false, "off must stay selectable");
+});
+
+await test("every mapped level is either null or itself", () => {
+	for (const id of ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4.1-flash", "claude-opus-5"]) {
+		const map = thinkingLevelMapFor(id);
+		if (map === undefined) continue;
+		for (const [level, value] of Object.entries(map)) {
+			if (value === null) continue;
+			assert.equal(value, level, `${id}: ${level} should map to itself`);
+		}
+	}
+});
+
+await test("clamps an effort carried over from another model", () => {
+	// `medium` is not in high/max, so it must become the next higher level
+	// rather than being forwarded (the API would accept and then ignore it).
+	assert.equal(clampEffort("deepseek/deepseek-v4-pro", "medium"), "high");
+	assert.equal(clampEffort("deepseek/deepseek-v4-pro", "minimal"), "high");
+	// Already-supported levels and the top end pass through.
+	assert.equal(clampEffort("deepseek/deepseek-v4-pro", "max"), "max");
+	assert.equal(clampEffort("deepseek/deepseek-v4-pro", "high"), "high");
+	// Unknown models yield undefined so the caller omits the field entirely.
+	assert.equal(clampEffort("some/unlisted-model", "high"), undefined);
+	// A value outside the known levels must never reach the wire.
+	assert.equal(clampEffort("deepseek/deepseek-v4-pro", "ultra"), undefined);
 });
 
 console.log("\nlive catalog");

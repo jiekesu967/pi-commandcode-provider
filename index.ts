@@ -62,6 +62,7 @@ import {
 	compareByPlan,
 	DEFAULT_CACHE_PATH,
 	modelVisibleInPlan,
+	thinkingLevelMapFor,
 } from "./catalog.ts";
 import { streamCommandCode } from "./stream.ts";
 import { transportSettingsFrom, edgeStatus, transportDiagnostics, createCommandCodeFetch } from "./net.ts";
@@ -434,6 +435,13 @@ export default async function (pi: ExtensionAPI) {
 				id: model.id,
 				name: model.name,
 				reasoning: model.efforts !== undefined && model.efforts.length > 0,
+				// Tell pi exactly which levels this model accepts. Without it the
+				// picker offers default levels to every reasoning model and hides
+				// `xhigh`/`max`, so those could never be selected even where the
+				// model supports them.
+				...(model.efforts !== undefined && model.efforts.length > 0
+					? { thinkingLevelMap: thinkingLevelMapFor(model.id) }
+					: {}),
 				input: (model.vision ? ["text", "image"] : ["text"]) as ("text" | "image")[],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: model.contextWindow,
@@ -441,10 +449,34 @@ export default async function (pi: ExtensionAPI) {
 			}));
 	};
 
-	/** (Re)register the provider with the models known right now. */
+	/**
+	 * (Re)register the provider with the models known right now.
+	 *
+	 * Safe to call from background continuations: after the session ends the
+	 * extension instance is invalidated and `pi.registerProvider` throws.
+	 * That is expected teardown, not an error — letting it escape turns a
+	 * slow catalog or billing response into an unhandled rejection that fails
+	 * the process (visible with `pi -p`, which exits as soon as the prompt is
+	 * done).
+	 */
 	const register = () => {
-		const models = buildModels();
-		if (models.length === 0) return;
+		let models: ReturnType<typeof buildModels> | undefined;
+		try {
+			models = buildModels();
+		} catch {
+			return;
+		}
+		if (models === undefined || models.length === 0) return;
+		try {
+			registerProviderWith(models);
+		} catch {
+			// The extension was torn down before this background refresh
+			// landed; there is nothing left to register.
+		}
+	};
+
+	/** The actual registration, split out so register() can guard it. */
+	const registerProviderWith = (models: ReturnType<typeof buildModels>) => {
 		pi.registerProvider(PROVIDER, {
 			name: "Command Code",
 			baseUrl: apiBase(),
@@ -501,17 +533,21 @@ export default async function (pi: ExtensionAPI) {
 	// a full catalog, then refresh live in the background. A failure keeps the
 	// cached catalog and surfaces a warning once a session starts.
 	await catalog.preloadFromCache();
+	// Filled in by the background refresh below and read by the
+	// synchronously-registered handler further down. Registering the handler
+	// from inside the failure callback would touch `pi` after startup, which
+	// throws once the instance is invalidated (e.g. `pi -p` exiting).
+	let catalogError: string | undefined;
 	void catalog
 		.load({ force: true })
 		.then(() => register())
 		.catch((error: unknown) => {
-			pi.on("session_start", (_event, ctx) => {
-				ctx.ui.notify(
-					`Command Code 模型目录加载失败：${error instanceof Error ? error.message : String(error)}`,
-					"warning",
-				);
-			});
+			catalogError = error instanceof Error ? error.message : String(error);
 		});
+	pi.on("session_start", (_event, ctx) => {
+		if (catalogError === undefined) return;
+		ctx.ui.notify(`Command Code 模型目录加载失败：${catalogError}`, "warning");
+	});
 	// The gateway refuses a stale CLI version on the transport the Go plan
 	// depends on, so resolve the current release rather than trusting the
 	// bundled constant. A failure just keeps the bundled value.

@@ -162,6 +162,59 @@ export function parseCatalogResponse(value: unknown): CatalogModel[] {
 	return models;
 }
 
+/** pi/CC reasoning levels, ordered from least to most effort. */
+const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+/** The pi `thinkingLevelMap` shape, narrowed to what this plugin emits. */
+export type ThinkingLevelMap = Partial<Record<"off" | (typeof EFFORT_ORDER)[number], string | null>>;
+
+/**
+ * Build pi's `thinkingLevelMap` for one model from the CLI's own effort list.
+ *
+ * Levels Command Code does not accept are marked `null`, which is how pi is
+ * told to hide them; accepted levels map to themselves because the CLI and
+ * pi spell the levels identically. `off` is omitted on purpose: it means
+ * "send no reasoning_effort", which every model tolerates, so it must stay
+ * selectable. `undefined` means the snapshot knows nothing — offer pi's
+ * defaults rather than hiding everything.
+ */
+export function thinkingLevelMapFor(modelId: string): ThinkingLevelMap | undefined {
+	const efforts = KNOWN_EFFORTS[modelId];
+	if (efforts === undefined || efforts.length === 0) return undefined;
+	const accepted = new Set(efforts);
+	const map: ThinkingLevelMap = {};
+	for (const level of EFFORT_ORDER) map[level] = accepted.has(level) ? level : null;
+	return map;
+}
+
+/**
+ * Clamp a requested effort onto what a model accepts, mirroring pi's
+ * `clampThinkingLevel`: try the same level, then higher ones, then lower
+ * ones. This matters when the model changes mid-session (the picker's level
+ * was chosen for the previous model) — without it the plugin would send an
+ * effort the model silently ignores.
+ *
+ * Returns `undefined` when the snapshot knows nothing about the model, which
+ * makes the caller omit `reasoning_effort` and let the server choose.
+ */
+export function clampEffort(modelId: string, requested: string): string | undefined {
+	const efforts = KNOWN_EFFORTS[modelId];
+	if (efforts === undefined || efforts.length === 0) return undefined;
+	if (efforts.includes(requested)) return requested;
+	const order: readonly string[] = EFFORT_ORDER;
+	const index = order.indexOf(requested);
+	if (index === -1) return undefined;
+	for (let i = index; i < order.length; i += 1) {
+		const candidate = order[i];
+		if (candidate !== undefined && efforts.includes(candidate)) return candidate;
+	}
+	for (let i = index - 1; i >= 0; i -= 1) {
+		const candidate = order[i];
+		if (candidate !== undefined && efforts.includes(candidate)) return candidate;
+	}
+	return undefined;
+}
+
 /** Read a cached catalog, or undefined when absent/corrupt/outdated. */
 export async function readCatalogCache(cachePath: string): Promise<CatalogModel[] | undefined> {
 	try {

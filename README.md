@@ -217,6 +217,25 @@ Tool parameters are JSON round-tripped on the way out because typebox schemas ca
 
 #### Those two helpers are missing from pi 1.0's packaged build
 
+### Supported pi versions
+
+Developed and verified against **pi 1.4.0** (`@earendil-works/pi-coding-agent`). It also
+loads on 1.0.x; the transcript shim below exists for hosts whose packaged release omits
+the pi-ai helpers.
+
+Two host capabilities this plugin now relies on, both verified at runtime on 1.4.0:
+
+| Capability | Why it matters here |
+|---|---|
+| `thinkingLevelMap` on registered models | Without it pi offers default levels to every reasoning model and hides `xhigh`/`max`, so those were unreachable even where Command Code supports them. |
+| `@earendil-works/pi-ai/models` subpath | Exposes `getSupportedThinkingLevels`; used to confirm the picker matches the model. |
+
+Reasoning effort is now model-accurate. Command Code accepts a narrower set than pi's
+default (some models only allow `high`/`max`), and it **silently accepts** an unsupported but
+legal level with HTTP 200 while running at default depth — so a mis-offered level looked
+like the setting was ignored. The plugin now emits a `thinkingLevelMap` per model and clamps
+a level carried over from another model instead of forwarding it.
+
 Being the right call does not make them reachable. Observed on pi 1.0.0: the **packaged release**
 exposes `@earendil-works/pi-ai` to extensions through a virtual module whose compat entry carries 100
 exports against 127 in the `dist/compat.js` on disk. `getCurrentSystemPrompt` and `getCurrentTools`
